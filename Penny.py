@@ -3,7 +3,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import urllib.request
-from datetime import datetime
+import urllib.parse
+import re
+import xml.etree.ElementTree as ET
+import email.utils
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -315,6 +320,15 @@ def analyze_pro(df, target, min_touches, drop_last=False):
         sl = entry + risk
         t1, t2 = max(entry - target, 0.05), max(entry - target - 5, 0.05)
 
+    ph, pl, pc = float(h.iloc[-2]), float(l.iloc[-2]), float(c.iloc[-2])
+    pvt = (ph + pl + pc) / 3
+    candle = ("Bullish engulfing" if bull_engulf else "Bearish engulfing" if bear_engulf else
+              "Hammer" if hammer else "Shooting star" if shooting else
+              "Strong bullish bar" if strong_close_up else "Strong bearish bar" if strong_close_dn else "None")
+
+    def _f(x, n=2):
+        return round(float(x), n) if pd.notna(x) else np.nan
+
     return {
         "last_close": round(last, 2), "side": side, "score": round(score, 1),
         "bull_score": round(bull, 1), "bear_score": round(bear, 1),
@@ -324,6 +338,19 @@ def analyze_pro(df, target, min_touches, drop_last=False):
         "rvol": round(rvol, 2) if not np.isnan(rvol) else np.nan,
         "rsi": round(rs, 1), "pattern": bp["pattern"], "ceiling": round(ceiling, 2), "floor": round(floor, 2),
         "signals": ", ".join(sigs), "as_of": str(d.index[-1]),
+        # ---- extra technicals for the detail panel ----
+        "ema9": _f(e9.iloc[-1]), "ema21": _f(e21.iloc[-1]), "ema50": _f(e50.iloc[-1]), "ema200": _f(e200.iloc[-1]),
+        "macd_hist": _f(hist.iloc[-1], 3), "macd_hist_prev": _f(hist.iloc[-2], 3),
+        "adx": _f(adx_v, 1), "pdi": _f(pdi_v, 1), "mdi": _f(mdi_v, 1),
+        "bb_pct": _f(bb_pct, 0), "vol_pct": _f(pr, 0),
+        "contracting": bp["contracting"], "wedge": bp["wedge"], "nr7": nr7, "inside": inside,
+        "hi20": _f(hi20), "lo20": _f(lo20), "hi252": _f(hi252), "lo252": _f(lo252),
+        "obv_up": bool(obv_up), "obv_dn": bool(obv_dn), "candle": candle,
+        "gap": "up" if gap_up else ("down" if gap_dn else ""),
+        "touches": bp["touches"], "base_width": _f(bp["width_pct"]), "vol_dryup": _f(bp["vol_dryup"]),
+        "hit_up": round(hit_up, 1), "hit_dn": round(hit_dn, 1),
+        "pivot": _f(pvt), "r1": _f(2 * pvt - pl), "s1": _f(2 * pvt - ph),
+        "r2": _f(pvt + (ph - pl)), "s2": _f(pvt - (ph - pl)),
     }
 
 
@@ -458,6 +485,319 @@ def run_scan(symbols, target, min_touches, drop_last, pmin, pmax, min_turn_cr):
     return pd.DataFrame(rows)
 
 
+# ---------------- NEWS / CATALYST SCAN ----------------
+POS_EVENTS = {
+    "Order win / contract": ["order", "orders", "bags", "wins", "secures", "contract", "letter of award", "loa", "tender"],
+    "Deal / M&A": ["acquire", "acquires", "acquisition", "merger", "takeover", "open offer", "block deal", "bulk deal", "stake buy"],
+    "Corporate action": ["dividend", "bonus", "stock split", "buyback", "special dividend"],
+    "Upgrade / rating": ["upgrade", "upgrades", "buy rating", "outperform", "initiates coverage"],
+    "Approval / regulatory nod": ["approval", "usfda", "clearance", "nod", "licence", "license"],
+    "Expansion / partnership": ["capacity", "expansion", "capex", "partnership", "tie-up", "launch", "joint venture"],
+    "Govt / policy tailwind": ["pli", "scheme", "subsidy", "policy boost"],
+}
+NEG_EVENTS = {
+    "Regulatory / legal risk": ["sebi", "penalty", "fine", "probe", "raid", "investigation", "fraud", "enforcement directorate", "ban"],
+    "Downgrade": ["downgrade", "downgrades", "sell rating", "underperform"],
+    "Governance / credit": ["resigns", "resignation", "default", "insolvency", "nclt", "auditor", "pledge", "delisting"],
+    "Dilution / supply": ["offer for sale", "ofs", "qip", "preferential issue", "rights issue", "dilution"],
+}
+NEUTRAL_EVENTS = {"Results": ["results", "earnings", "quarter", "q1", "q2", "q3", "q4"],
+                  "Analyst view": ["target price", "brokerage"]}
+POS_WORDS = ["jumps", "surges", "rallies", "soars", "rises", "gains", "record", "beats", "strong", "spikes", "climbs", "profit up"]
+NEG_WORDS = ["falls", "drops", "plunges", "tumbles", "slumps", "misses", "weak", "loss", "cuts", "slides", "sinks"]
+SPIKE_TAGS = {"Order win / contract", "Deal / M&A", "Corporate action", "Upgrade / rating", "Approval / regulatory nod"}
+
+
+def _has(text, kws):
+    return [k for k in kws if re.search(r"\b" + re.escape(k) + r"\b", text)]
+
+
+def classify(title):
+    t = title.lower()
+    pos = [n for n, k in POS_EVENTS.items() if _has(t, k)]
+    neg = [n for n, k in NEG_EVENTS.items() if _has(t, k)]
+    neu = [n for n, k in NEUTRAL_EVENTS.items() if _has(t, k)]
+    sent = len(pos) + len(_has(t, POS_WORDS)) - len(neg) - len(_has(t, NEG_WORDS))
+    return pos, neg, neu, sent
+
+
+def _to_dt(x):
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)) or str(x).replace(".", "").isdigit():
+            return datetime.fromtimestamp(float(x), tz=timezone.utc)
+        s = str(x)
+        try:
+            dt = email.utils.parsedate_to_datetime(s)
+        except Exception:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_name_map():
+    try:
+        df = _get_csv("https://archives.nseindia.com/content/equities/EQUITY_L.csv")
+        df.columns = [c.strip() for c in df.columns]
+        return dict(zip(df["SYMBOL"].astype(str).str.strip(), df["NAME OF COMPANY"].astype(str).str.strip()))
+    except Exception:
+        return {}
+
+
+def _news_raw(symbol, name=""):
+    """No Streamlit calls in here -> safe to run in threads."""
+    items, tk = [], to_yahoo_symbol(symbol)
+    try:  # 1) Yahoo Finance ticker news
+        for n in (yf.Ticker(tk).news or []):
+            c = n.get("content", n) or {}
+            title = c.get("title") or n.get("title")
+            if not title:
+                continue
+            link = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
+                    or c.get("link") or n.get("link") or "")
+            src = (c.get("provider") or {}).get("displayName") or n.get("publisher") or "Yahoo Finance"
+            items.append({"title": title.strip(), "link": link, "source": src,
+                          "dt": _to_dt(c.get("pubDate") or c.get("displayTime") or n.get("providerPublishTime"))})
+    except Exception:
+        pass
+    try:  # 2) Google News RSS (India edition), last 7 days
+        clean = re.sub(r"\b(limited|ltd\.?)\b", "", name, flags=re.I).strip() if name else ""
+        q = f'"{clean}" when:7d' if clean else f"{symbol} NSE stock when:7d"
+        url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(q) + "&hl=en-IN&gl=IN&ceid=IN:en"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            root = ET.fromstring(r.read())
+        for it in list(root.iter("item"))[:15]:
+            title = (it.findtext("title") or "").strip()
+            src = (it.findtext("source") or "Google News").strip()
+            if title.endswith(" - " + src):
+                title = title[: -(len(src) + 3)]
+            if title:
+                items.append({"title": title, "link": it.findtext("link") or "", "source": src,
+                              "dt": _to_dt(it.findtext("pubDate"))})
+    except Exception:
+        pass
+
+    now, seen, out, net, spike = datetime.now(timezone.utc), set(), [], 0.0, False
+    for it in items:
+        key = re.sub(r"\W+", "", it["title"].lower())[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        age = (now - it["dt"]).total_seconds() / 3600 if it["dt"] else 999
+        if age > 24 * 7:
+            continue
+        pos, neg, neu, sent = classify(it["title"])
+        w = 1.0 if age <= 24 else 0.6 if age <= 72 else 0.3
+        net += w * float(np.sign(sent))
+        if age <= 36 and sent > 0 and any(t in SPIKE_TAGS for t in pos):
+            spike = True
+        out.append({**it, "age_h": age, "pos": pos, "neg": neg, "neu": neu, "sent": sent})
+    out.sort(key=lambda x: x["age_h"])
+
+    nxt = ""
+    try:
+        cal = yf.Ticker(tk).calendar
+        ed = (cal.get("Earnings Date") or [None])[0] if isinstance(cal, dict) else None
+        if ed is not None:
+            days = (pd.Timestamp(ed).date() - datetime.now().date()).days
+            if 0 <= days <= 7:
+                nxt = f"Results expected in {days} day(s) ({ed})"
+    except Exception:
+        pass
+
+    if not out:
+        label = "⚪ No news (7d)"
+    elif spike and net > 0:
+        label = "🟢🚀 Fresh positive catalyst"
+    elif net >= 1:
+        label = "🟢 Positive news"
+    elif net <= -1:
+        label = "🔴 Negative news"
+    else:
+        label = "🟡 Neutral / mixed"
+    if nxt and not label.startswith("🔴"):
+        label += " · 📅 results soon"
+    return {"items": out[:10], "net": net, "label": label, "spike": spike, "next_earnings": nxt}
+
+
+def get_news(symbol, force=False):
+    hit = st.session_state.news.get(symbol)
+    if hit and not force and (datetime.now() - hit[0]).total_seconds() < 900:
+        return hit[1]
+    res = _news_raw(symbol, fetch_name_map().get(symbol, ""))
+    st.session_state.news[symbol] = (datetime.now(), res)
+    st.session_state.news_labels[symbol] = res["label"]
+    return res
+
+
+def scan_news(scan_df, n):
+    if scan_df.empty:
+        return
+    top = scan_df.sort_values("score", ascending=False).head(n)["symbol"].tolist()
+    names = fetch_name_map()
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda s: (s, _news_raw(s, names.get(s, ""))), top))
+    for s, r in results:
+        st.session_state.news[s] = (datetime.now(), r)
+        st.session_state.news_labels[s] = r["label"]
+
+
+# ---------------- TECHNICALS PANEL + MOMENTUM EXPLANATION ----------------
+def _rd(bull, bear):
+    return "🟢 Bullish" if bull else ("🔴 Bearish" if bear else "⚪ Neutral")
+
+
+def tech_table(r):
+    px, tgt = r["live_price"], st.session_state.get("target", 30)
+    rows = []
+
+    def add(name, value, reading):
+        rows.append({"Indicator": name, "Value": str(value), "Reading": reading})
+
+    add("Price vs EMA 9 / 21 / 50 / 200", f"{px:.2f} | {r['ema9']} / {r['ema21']} / {r['ema50']} / {r['ema200']}",
+        _rd(r["ema9"] > r["ema21"] > r["ema50"] and px > r["ema50"], r["ema9"] < r["ema21"] < r["ema50"] and px < r["ema50"]))
+    rs = r["rsi"]
+    add("RSI (14)", rs, "🟡 Overbought - chase risk" if rs > 75 else "🟢 Bullish momentum zone" if rs >= 55 else
+        "⚪ Neutral" if rs >= 45 else "🔴 Bearish momentum" if rs >= 25 else "🟡 Oversold - bounce risk")
+    add("MACD histogram", f"{r['macd_hist']} (prev {r['macd_hist_prev']})",
+        _rd(r["macd_hist"] > 0 and r["macd_hist"] > r["macd_hist_prev"], r["macd_hist"] < 0 and r["macd_hist"] < r["macd_hist_prev"]))
+    trend = "🟢 Strong uptrend" if r["adx"] >= 25 and r["pdi"] > r["mdi"] else "🔴 Strong downtrend" if r["adx"] >= 25 else \
+            "⚪ Trend developing" if r["adx"] >= 20 else "⚪ Weak trend / ranging (typical before a squeeze breaks)"
+    add("ADX (+DI / -DI)", f"{r['adx']} ({r['pdi']} / {r['mdi']})", trend)
+    add("ATR (14) daily range", f"₹{r['atr']} ({r['atr_pct']}%)", f"Target of {tgt} pts = {tgt / r['atr']:.1f} ATR")
+    vp = r["vol_pct"]
+    add("Volatility percentile (envelope)", f"{vp:.0f}th" if pd.notna(vp) else "n/a",
+        "🟢 Squeezed (≤30)" if pd.notna(vp) and vp <= 30 else "🟡 Already expanded (>70)" if pd.notna(vp) and vp > 70 else "⚪ Normal")
+    bp_ = r["bb_pct"]
+    add("Bollinger width percentile", f"{bp_:.0f}th" if pd.notna(bp_) else "n/a",
+        "🟢 Squeezed (≤20)" if pd.notna(bp_) and bp_ <= 20 else "⚪ Normal")
+    add("Contracting / Wedge / NR7 / Inside day",
+        " / ".join("Yes" if x else "No" for x in [r["contracting"], r["wedge"], r["nr7"], r["inside"]]),
+        "🟢 Compression present" if (r["contracting"] or r["wedge"] or r["nr7"]) else "⚪ None")
+    rv = r["rvol"]
+    add("Relative volume (today vs 20D avg)", f"{rv}x" if pd.notna(rv) else "n/a",
+        "🟢 Surge (≥1.5x)" if pd.notna(rv) and rv >= 1.5 else "⚪ Average" if pd.notna(rv) and rv >= 1 else "🟡 Light (may be early in session)")
+    add("OBV trend (10 bars)", "Rising" if r["obv_up"] else "Falling" if r["obv_dn"] else "Flat",
+        _rd(r["obv_up"], r["obv_dn"]))
+    add("Candle pattern", r["candle"] + (f" | gap {r['gap']}" if r["gap"] else ""),
+        _rd(r["candle"] in ("Bullish engulfing", "Hammer", "Strong bullish bar"),
+            r["candle"] in ("Bearish engulfing", "Shooting star", "Strong bearish bar")))
+    d20 = (r["hi20"] - px) / px * 100
+    add("20-day range", f"{r['lo20']} - {r['hi20']}",
+        "🟢 Above 20D high (breakout)" if px > r["hi20"] else "🔴 Below 20D low" if px < r["lo20"] else f"⚪ {d20:.1f}% below 20D high")
+    d52 = (r["hi252"] - px) / px * 100
+    add("52-week range", f"{r['lo252']} - {r['hi252']}", f"{d52:.1f}% below 52W high" if d52 > 0 else "🟢 At/above 52W high")
+    add("Flat-top base", f"Ceiling {r['ceiling']} / Floor {r['floor']} · width {r['base_width']}% · {r['touches']} touches",
+        f"🟢 {r['pattern']}" if r["pattern"] else "⚪ No valid base")
+    if pd.notna(r["vwap"]):
+        add("VWAP (today, 15m)", f"{r['vwap']:.2f}", _rd(px > r["vwap"], px < r["vwap"]))
+    add(f"Hit rate: ≥{tgt} pts within 2 days (last year)", f"Up {r['hit_up']}% | Down {r['hit_dn']}%",
+        "🟢 Proven mover" if max(r["hit_up"], r["hit_dn"]) >= 8 else "🟡 Occasional" if max(r["hit_up"], r["hit_dn"]) >= 3 else "🔴 Rarely moves this much")
+    return pd.DataFrame(rows)
+
+
+def explain(r, news):
+    tgt = st.session_state.get("target", 30)
+    buy = r["side"] == "BUY"
+    px, a = r["live_price"], r["atr"]
+    why, risks = [], []
+    up = "up" if buy else "down"
+
+    if pd.notna(r["vol_pct"]) and r["vol_pct"] <= 30:
+        why.append(f"**Coiled volatility** - the envelope width is in the lowest {r['vol_pct']:.0f}% of the last 100 sessions"
+                   + (", still contracting" if r["contracting"] else "") + (", with a converging wedge" if r["wedge"] else "")
+                   + ". Tight ranges tend to be followed by expansion; the trigger below decides the direction.")
+    if pd.notna(r["bb_pct"]) and r["bb_pct"] <= 20:
+        why.append(f"**Bollinger squeeze** - band width is in the lowest {r['bb_pct']:.0f}% of the last 120 bars"
+                   + (" and today is the narrowest range in 7 days (NR7)." if r["nr7"] else "."))
+    if buy:
+        if r["pattern"] == "Setup":
+            why.append(f"**Flat-top base** - price is pressing a ceiling at ₹{r['ceiling']} (tested {r['touches']}x, base width {r['base_width']}%) "
+                       f"with higher lows, meaning sellers at that level are being absorbed. A move above ₹{r['entry']} is the trigger.")
+        elif r["pattern"] == "Breakout":
+            why.append(f"**Fresh breakout** - price has just closed above a tight base ceiling of ₹{r['ceiling']}; "
+                       "breakouts from tight bases are where quick follow-through moves usually start.")
+        if px > r["hi20"]:
+            why.append(f"**20-day high broken** (₹{r['hi20']}) - new short-term highs mean no overhead supply from the last month.")
+        if r["ema9"] > r["ema21"] > r["ema50"]:
+            why.append("**Trend aligned** - EMA 9 > 21 > 50" + (" and price is above the 200 EMA." if px > r["ema200"] else "."))
+        if 55 <= r["rsi"] <= 75:
+            why.append(f"**Momentum building** - RSI {r['rsi']} sits in the 55-75 zone (strength without being overbought).")
+        if r["macd_hist"] > 0 and r["macd_hist"] > r["macd_hist_prev"]:
+            why.append("**MACD histogram positive and rising** - momentum is accelerating.")
+        if r["adx"] >= 20 and r["pdi"] > r["mdi"]:
+            why.append(f"**Directional strength** - ADX {r['adx']} with +DI ({r['pdi']}) above -DI ({r['mdi']}).")
+        if r["candle"] in ("Bullish engulfing", "Hammer", "Strong bullish bar"):
+            why.append(f"**Candle signal** - {r['candle'].lower()} on the latest bar.")
+        if r["gap"] == "up":
+            why.append("**Gap-up open** - buyers were willing to pay up at the open.")
+        if pd.notna(r["vol_dryup"]) and r["vol_dryup"] < 1:
+            why.append(f"**Volume dried up inside the base** ({r['vol_dryup']}x of prior) - usually a sign selling pressure is exhausted.")
+        if r["hi252"] and (r["hi252"] - px) / px * 100 <= 8:
+            why.append(f"**Near the 52-week high** (₹{r['hi252']}) - little historical resistance above.")
+    else:
+        if px < r["floor"]:
+            why.append(f"**Base breakdown** - price is below the recent floor of ₹{r['floor']}, so buyers at that level are trapped.")
+        if px < r["lo20"]:
+            why.append(f"**20-day low broken** (₹{r['lo20']}).")
+        if r["ema9"] < r["ema21"] < r["ema50"]:
+            why.append("**Downtrend aligned** - EMA 9 < 21 < 50" + (" and price is below the 200 EMA." if px < r["ema200"] else "."))
+        if 25 <= r["rsi"] <= 45:
+            why.append(f"**Bearish momentum** - RSI {r['rsi']} in the 25-45 zone.")
+        if r["macd_hist"] < 0 and r["macd_hist"] < r["macd_hist_prev"]:
+            why.append("**MACD histogram negative and falling.**")
+        if r["adx"] >= 20 and r["mdi"] > r["pdi"]:
+            why.append(f"**Directional strength** - ADX {r['adx']} with -DI ({r['mdi']}) above +DI ({r['pdi']}).")
+        if r["candle"] in ("Bearish engulfing", "Shooting star", "Strong bearish bar"):
+            why.append(f"**Candle signal** - {r['candle'].lower()}.")
+        if r["gap"] == "down":
+            why.append("**Gap-down open.**")
+    if pd.notna(r["rvol"]) and r["rvol"] >= 1.5:
+        why.append(f"**Volume confirmation** - {r['rvol']}x the 20-day average.")
+    hit = r["hit_up"] if buy else r["hit_dn"]
+    if hit >= 3:
+        n_days = round(hit * 2.5)
+        why.append(f"**Proven reach** - in the past year this stock moved ≥{tgt} pts {up} within 2 days on about {hit:.0f}% of days (~{n_days} times).")
+    if not why:
+        why.append("Few strong signals - this made the list mainly on its combined score. Treat it as low conviction.")
+
+    stretch = tgt / a
+    if stretch > 3:
+        risks.append(f"Target of {tgt} pts is **{stretch:.1f}x ATR** - a stretch for 2 days; only ~{hit:.0f}% of past days did it.")
+    if buy and r["rsi"] > 75:
+        risks.append(f"RSI {r['rsi']} is overbought - risk of a pullback right after entry.")
+    if (not buy) and r["rsi"] < 25:
+        risks.append(f"RSI {r['rsi']} is oversold - short-covering bounces are common.")
+    if pd.notna(r["rvol"]) and r["rvol"] < 1:
+        risks.append("Volume is below average so far (may just be early in the session) - breakouts without volume fail more often.")
+    if pd.notna(r["vwap"]):
+        if buy and px < r["vwap"]:
+            risks.append(f"Price (₹{px:.2f}) is below today's VWAP (₹{r['vwap']:.2f}) - intraday sellers in control.")
+        if (not buy) and px > r["vwap"]:
+            risks.append(f"Price is above today's VWAP (₹{r['vwap']:.2f}) - intraday buyers in control.")
+    if r["turnover_cr"] < 10:
+        risks.append(f"Average turnover is only ₹{r['turnover_cr']} Cr/day - slippage on entry/exit is likely.")
+    if news:
+        if news["label"].startswith("🔴"):
+            risks.append("**Negative headlines in the last 7 days** (see News below) - can gap the stock against you.")
+        if news.get("next_earnings"):
+            risks.append(f"{news['next_earnings']} - results can gap either way; consider smaller size or exit before.")
+    risks.append(f"Stop loss ₹{r['sl']} ({r['risk']} pts risk). Gaps can jump past a stop, so size the position so this loss is acceptable.")
+
+    catalyst = ""
+    if news and news["items"] and news["net"] > 0 and (news["spike"] or news["label"].startswith("🟢")):
+        catalyst = f"\n\n**News catalyst:** {news['items'][0]['title'][:110]} - a fresh positive headline can add fuel to a technical setup."
+
+    plan = (f"\n\n**Plan ({r['side']}):** entry ₹{r['entry']} · stop ₹{r['sl']} · T1 ₹{r['t1']} · T2 ₹{r['t2']} · "
+            f"R:R {r['rr']}. Suggested handling: book half at the midpoint to T1, then move the stop to entry.")
+    return ("**Why it could move**\n" + "\n".join(f"- {x}" for x in why) + catalyst +
+            "\n\n**What could go wrong**\n" + "\n".join(f"- {x}" for x in risks) + plan)
+
+
 def refresh_live(scan, n):
     if scan.empty:
         return {}
@@ -482,7 +822,7 @@ st.caption("Ranks stocks by squeeze + breakout + momentum + volume signals AND h
            "really moved your target points within 2 days. It ranks probability; it cannot guarantee any move. "
            "Always place the stop loss.")
 
-for k, v in {"scan_data": pd.DataFrame(), "live": {}}.items():
+for k, v in {"scan_data": pd.DataFrame(), "live": {}, "news": {}, "news_labels": {}}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -499,6 +839,7 @@ with st.sidebar:
     drop_last = st.checkbox("Ignore in-progress candle", False)
     max_syms = st.number_input("Max symbols (0 = all, use ~300 to test fast)", 0, 5000, 0)
     live_n = st.slider("Live-check top N stocks", 10, 100, 50)
+    news_n = st.slider("News-scan top N stocks", 10, 60, 30)
 
     if st.button("🔄 Run Full Scan", type="primary", width="stretch"):
         if universe == "Custom list":
@@ -519,12 +860,21 @@ with st.sidebar:
             with st.spinner("Fetching live 15m prices & VWAP..."):
                 st.session_state.live = refresh_live(st.session_state.scan_data, live_n)
                 st.session_state.live_time = datetime.now().strftime("%H:%M:%S")
+            with st.spinner("Scanning news for top stocks..."):
+                scan_news(st.session_state.scan_data, news_n)
 
     if st.button("⚡ Refresh Live Prices Only", width="stretch"):
         with st.spinner("Refreshing..."):
             fetch_live_batch.clear()
             st.session_state.live = refresh_live(st.session_state.scan_data, live_n)
             st.session_state.live_time = datetime.now().strftime("%H:%M:%S")
+
+    if st.button("📰 Scan News for Top Stocks", width="stretch"):
+        if st.session_state.scan_data.empty:
+            st.warning("Run a scan first.")
+        else:
+            with st.spinner("Scanning news..."):
+                scan_news(st.session_state.scan_data, news_n)
 
     st.divider()
     st.header("🔍 Filters")
@@ -534,6 +884,7 @@ with st.sidebar:
     min_rr = st.slider("Min reward:risk", 0.5, 5.0, 1.5, 0.1)
     only_actionable = st.checkbox("Only actionable (Buy/Sell now or stop-orders)", False)
     search_q = st.text_input("Search symbol")
+    only_news = st.checkbox("Only fresh positive news catalyst (needs news scan)", False)
 
 scan = st.session_state.scan_data
 
@@ -548,13 +899,19 @@ else:
         f"circuit: {stt.get('circuit', 0)}, no data: {stt.get('no_data', 0)}"
     )
 
+    if "ema9" not in scan.columns:
+        st.info("Scan data is from an older version - click **Run Full Scan** again.")
+        st.stop()
     view = apply_live(scan, st.session_state.live)
+    view["News"] = view["symbol"].map(st.session_state.news_labels).fillna("—")
     view = view[view["side"].isin(sides) & (view["score"] >= min_score)
                 & (view["hit_rate"] >= min_hit) & (view["rr"] >= min_rr)]
     if search_q:
         view = view[view["symbol"].str.contains(search_q, case=False)]
     if only_actionable:
         view = view[view["Action"].str.contains("NOW|Buy-stop|Sell-stop", regex=True)]
+    if only_news:
+        view = view[view["News"].str.contains("🟢")]
     view = view.sort_values(["score", "hit_rate"], ascending=False)
 
     if view.empty:
@@ -563,9 +920,9 @@ else:
     else:
         tgt = st.session_state.get("target", target)
         out = view[["symbol", "Action", "side", "live_price", "entry", "sl", "t1", "t2", "risk", "rr", "score",
-                    "hit_rate", "atr", "rvol", "pattern", "signals", "Live"]].copy()
+                    "hit_rate", "atr", "rvol", "pattern", "News", "signals", "Live"]].copy()
         out.columns = ["Symbol", "Action", "Side", "Price", "Entry", "Stop Loss", f"T1 (+{tgt})", f"T2 (+{tgt + 5})",
-                       "Risk pts", "R:R", "Score", "2D Hit %", "ATR", "RVOL", "Pattern", "Signals", "Live"]
+                       "Risk pts", "R:R", "Score", "2D Hit %", "ATR", "RVOL", "Pattern", "News", "Signals", "Live"]
         st.dataframe(out, width="stretch", hide_index=True)
         st.caption("Entry = buy-stop / sell-stop trigger (or current price if already triggered). "
                    "Suggested handling: book half at halfway to T1, move SL to entry after that, exit the rest at T1/T2. "
@@ -614,3 +971,27 @@ else:
                 if row["pattern"]:
                     add_level("Ceiling", row["ceiling"], "rgba(255,165,0,0.9)")
                 chart.load()
+
+        # ---------------- TECHNICALS, MOMENTUM EXPLANATION, NEWS ----------------
+        st.subheader(f"🧮 Technicals - {sym}")
+        st.dataframe(tech_table(row), width="stretch", hide_index=True)
+        pc_ = st.columns(5)
+        for col, (nm, key) in zip(pc_, [("R2", "r2"), ("R1", "r1"), ("Pivot", "pivot"), ("S1", "s1"), ("S2", "s2")]):
+            col.metric(nm, f"₹{row[key]}")
+
+        with st.spinner("Checking news..."):
+            nres = get_news(sym)
+
+        st.subheader(f"🧠 Why {sym} could take momentum")
+        st.markdown(explain(row, nres))
+
+        st.subheader("📰 News & catalysts (last 7 days)")
+        st.markdown(f"**{nres['label']}**" + (f"  ·  {nres['next_earnings']}" if nres["next_earnings"] else ""))
+        if not nres["items"]:
+            st.caption("No recent headlines found. Absence of news does not mean absence of a catalyst - check NSE announcements.")
+        for it in nres["items"][:8]:
+            tags = " ".join([f"`+{t}`" for t in it["pos"]] + [f"`-{t}`" for t in it["neg"]] + [f"`{t}`" for t in it["neu"]])
+            age = f"{it['age_h']:.0f}h ago" if it["age_h"] < 48 else f"{it['age_h'] / 24:.0f}d ago"
+            st.markdown(f"- [{it['title']}]({it['link']}) - *{it['source']}, {age}* {tags}")
+        st.caption("News tags come from keyword matching on headlines, so they are a screening aid, not a verdict. "
+                   "Read the story before acting. Exchange filings (NSE/BSE announcements) are not included.")
